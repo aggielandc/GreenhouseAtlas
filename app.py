@@ -40,6 +40,12 @@ ELECTRICITY_QAR_KWH = 0.20
 WATER_QAR_M3 = 5.0
 COOLING_HOURS_YEAR = 1900
 T_SET_C = 25.0
+CGIS_GROUNDWATER_WELLS_URL = (
+    "https://services.gisqatar.org.qa/server/rest/services/Vector/Water/MapServer/1/query"
+    "?where=SUBTYPECD%3D2"
+    "&outFields=OBJECTID,SUBTYPEDESCRIPTION,LIFECYCLESTATUS,ASSETID,DATASOURCE"
+    "&returnGeometry=true&f=geojson&outSR=4326"
+)
 
 
 QATAR_POLYGON = Polygon(
@@ -73,6 +79,28 @@ REFERENCE_STATIONS = {
     "Ruwais": (51.221, 26.142, 39.2, 65.0, 860.0),
 }
 
+NATIONAL_GW_SAFE_YIELD_M3_YEAR = 57_200_000.0
+NATIONAL_GW_ABSTRACTION_M3_YEAR = 250_000_000.0
+NATIONAL_GW_STRESS_RATIO = NATIONAL_GW_ABSTRACTION_M3_YEAR / NATIONAL_GW_SAFE_YIELD_M3_YEAR
+
+GW_SOURCE_SUMMARY = (
+    "Composite groundwater score uses public/peer-reviewed screening defaults: CGIS Qatar for hydrogeological "
+    "station geometry; Ajjur & Al-Ghamdi 2022 for Kahramaa 2021 groundwater-level map with 313 monitored wells "
+    "and northern/southern basin context; Bilal et al. 2025 for salinity, transmissivity, and storativity classes "
+    "sourced to Ministry of Environment / Schlumberger Water Services 2009; USGS OFR 85-343 for recharge context. "
+    "Exact official well quality, yield, level, and permit fields override these proxies when present."
+)
+
+GW_REQUIRED_FIELDS = [
+    "tds_mg_l",
+    "water_level_m_bgl",
+    "well_yield_m3_day",
+    "permitted_abstraction_m3_year",
+    "transmissivity_m2_day",
+    "storativity",
+    "aquifer_stress_ratio",
+]
+
 
 @dataclass(frozen=True)
 class CropProfile:
@@ -102,6 +130,77 @@ class GreenhouseTech:
     energy_multiplier: float
     labour_factor: float
     description: str
+
+
+@dataclass(frozen=True)
+class GroundwaterRegionalProfile:
+    zone: str
+    source_tier: str
+    source_note: str
+    tds_mg_l: float
+    water_level_m_bgl: float
+    well_yield_m3_day: float
+    permitted_abstraction_m3_year: float
+    transmissivity_m2_day: float
+    storativity: float
+    aquifer_stress_ratio: float
+    confidence: float
+
+
+GROUNDWATER_REGIONAL_PROFILES: Dict[str, GroundwaterRegionalProfile] = {
+    "Northern aquifer / farm belt": GroundwaterRegionalProfile(
+        zone="Northern aquifer / farm belt",
+        source_tier="B/C proxy",
+        source_note="Ajjur & Al-Ghamdi 2022; Bilal et al. 2025; Schlumberger/MoE 2009 cited classes",
+        tds_mg_l=2_200.0,
+        water_level_m_bgl=30.0,
+        well_yield_m3_day=420.0,
+        permitted_abstraction_m3_year=np.nan,
+        transmissivity_m2_day=500.0,
+        storativity=1e-2,
+        aquifer_stress_ratio=3.4,
+        confidence=0.68,
+    ),
+    "Central Qatar / transition aquifer": GroundwaterRegionalProfile(
+        zone="Central Qatar / transition aquifer",
+        source_tier="C proxy",
+        source_note="Interpolated from Qatar aquifer literature and Ministry/Schlumberger class ranges",
+        tds_mg_l=4_200.0,
+        water_level_m_bgl=38.0,
+        well_yield_m3_day=250.0,
+        permitted_abstraction_m3_year=np.nan,
+        transmissivity_m2_day=180.0,
+        storativity=1e-3,
+        aquifer_stress_ratio=NATIONAL_GW_STRESS_RATIO,
+        confidence=0.55,
+    ),
+    "Southern / southwestern stressed aquifer": GroundwaterRegionalProfile(
+        zone="Southern / southwestern stressed aquifer",
+        source_tier="C proxy",
+        source_note="Ajjur & Al-Ghamdi 2022 reports lower quality than northern aquifer; Bilal et al. 2025 salinity classes",
+        tds_mg_l=7_500.0,
+        water_level_m_bgl=49.0,
+        well_yield_m3_day=120.0,
+        permitted_abstraction_m3_year=np.nan,
+        transmissivity_m2_day=55.0,
+        storativity=1e-4,
+        aquifer_stress_ratio=5.2,
+        confidence=0.48,
+    ),
+    "Coastal saline / industrial fringe": GroundwaterRegionalProfile(
+        zone="Coastal saline / industrial fringe",
+        source_tier="C proxy",
+        source_note="Qatar coastal salinity and seawater-intrusion literature; Al-Maktoumi et al. 2025",
+        tds_mg_l=9_000.0,
+        water_level_m_bgl=24.0,
+        well_yield_m3_day=160.0,
+        permitted_abstraction_m3_year=np.nan,
+        transmissivity_m2_day=110.0,
+        storativity=5e-4,
+        aquifer_stress_ratio=4.8,
+        confidence=0.48,
+    ),
+}
 
 
 class AdvancedGreenhouseEngine:
@@ -355,11 +454,45 @@ def synthetic_landuse() -> gpd.GeoDataFrame:
     )
 
 
+def synthetic_groundwater_wells() -> gpd.GeoDataFrame:
+    records = [
+        ("GW-ALSHAHANIYA-01", "Synthetic hydrogeological well proxy", "Central Qatar / transition aquifer", Point(51.08, 25.33)),
+        ("GW-RAWDAT-01", "Synthetic hydrogeological well proxy", "Central Qatar / transition aquifer", Point(51.08, 24.98)),
+        ("GW-UMMSALAL-01", "Synthetic hydrogeological well proxy", "Northern aquifer / farm belt", Point(51.34, 25.50)),
+        ("GW-NORTH-01", "Synthetic hydrogeological well proxy", "Northern aquifer / farm belt", Point(51.15, 25.78)),
+        ("GW-SOUTH-01", "Synthetic hydrogeological well proxy", "Southern / southwestern stressed aquifer", Point(50.98, 24.78)),
+        ("GW-MESAIEED-01", "Synthetic hydrogeological well proxy", "Coastal saline / industrial fringe", Point(51.42, 24.90)),
+    ]
+    profiles = [GROUNDWATER_REGIONAL_PROFILES[record[2]] for record in records]
+    return gpd.GeoDataFrame(
+        {
+            "name": [record[0] for record in records],
+            "subtype": [record[1] for record in records],
+            "aquifer_zone": [record[2] for record in records],
+            "source": [profile.source_note for profile in profiles],
+            "source_tier": [profile.source_tier for profile in profiles],
+            "tds_mg_l": [profile.tds_mg_l for profile in profiles],
+            "water_level_m_bgl": [profile.water_level_m_bgl for profile in profiles],
+            "well_yield_m3_day": [profile.well_yield_m3_day for profile in profiles],
+            "permitted_abstraction_m3_year": [profile.permitted_abstraction_m3_year for profile in profiles],
+            "transmissivity_m2_day": [profile.transmissivity_m2_day for profile in profiles],
+            "storativity": [profile.storativity for profile in profiles],
+            "aquifer_stress_ratio": [profile.aquifer_stress_ratio for profile in profiles],
+            "groundwater_confidence": [profile.confidence for profile in profiles],
+        },
+        geometry=[record[3] for record in records],
+        crs=QATAR_CRS,
+    )
+
+
 def off_land_result() -> dict:
     return {
         "feasible": False,
         "landuse": "Water/offshore",
         "landuse_name": "Outside the Qatar land mask",
+        "groundwater_distance_m": float("inf"),
+        "groundwater_score": 0.0,
+        "groundwater_source": "Not applicable",
         "crop": "Not applicable",
         "technology": "Not applicable",
         "temp_c": np.nan,
@@ -407,6 +540,31 @@ def load_vector_layer(filename: str, fallback: str) -> gpd.GeoDataFrame:
     return synthetic_landuse()
 
 
+@st.cache_data(show_spinner=False)
+def load_groundwater_wells() -> gpd.GeoDataFrame:
+    local_path = DATA_DIR / "qatar_groundwater_wells.geojson"
+    if local_path.exists():
+        wells = gpd.read_file(local_path).to_crs(QATAR_CRS)
+        wells["source"] = wells.get("source", "Local qatar_groundwater_wells.geojson")
+        wells["subtype"] = wells.get("subtype", wells.get("SUBTYPEDESCRIPTION", "Groundwater well"))
+        wells["name"] = wells.get("name", wells.get("ASSETID", wells.index.astype(str)))
+        return wells
+
+    try:
+        wells = gpd.read_file(CGIS_GROUNDWATER_WELLS_URL).to_crs(QATAR_CRS)
+        if not wells.empty:
+            wells["name"] = wells.get("ASSETID", wells["OBJECTID"].astype(str) if "OBJECTID" in wells.columns else wells.index.astype(str))
+            wells["subtype"] = wells.get("SUBTYPEDESCRIPTION", "HydrogeologicalStation")
+            wells["source"] = "CGIS Qatar Vector/Water WATER.Facility HydrogeologicalStation"
+            return wells
+    except Exception:
+        pass
+
+    fallback = synthetic_groundwater_wells()
+    fallback["source"] = "Synthetic fallback; replace with CGIS or official groundwater wells GeoJSON"
+    return fallback
+
+
 def allowed_landuse(landuse: str) -> bool:
     return landuse in {"Agricultural", "Open desert/rangeland", "Unclassified open land"}
 
@@ -423,6 +581,22 @@ def point_distance_m(point: Point, layer: gpd.GeoDataFrame) -> float:
     point_gdf = gpd.GeoDataFrame(geometry=[point], crs=QATAR_CRS).to_crs(QATAR_METRIC_CRS)
     projected = layer.to_crs(QATAR_METRIC_CRS)
     return float(point_gdf.geometry.iloc[0].distance(projected.geometry).min())
+
+
+def nearest_feature_info(point: Point, layer: gpd.GeoDataFrame, name_field: str = "name") -> dict:
+    if layer.empty:
+        return {"distance_m": float("inf"), "name": "Unavailable", "source": "No groundwater layer"}
+    point_gdf = gpd.GeoDataFrame(geometry=[point], crs=QATAR_CRS).to_crs(QATAR_METRIC_CRS)
+    projected = layer.to_crs(QATAR_METRIC_CRS)
+    distances = projected.geometry.distance(point_gdf.geometry.iloc[0])
+    idx = distances.idxmin()
+    feature = layer.loc[idx]
+    return {
+        "distance_m": float(distances.loc[idx]),
+        "name": str(feature.get(name_field, feature.get("ASSETID", "Nearest groundwater feature"))),
+        "source": str(feature.get("source", "Groundwater layer")),
+        "attributes": {str(col): feature.get(col) for col in layer.columns if col != "geometry"},
+    }
 
 
 def polygon_distance_m(poly: Polygon, layer: gpd.GeoDataFrame) -> float:
@@ -452,6 +626,172 @@ def normalize_distance(distance_m: float, ideal_m: float, max_m: float) -> float
     if distance_m >= max_m:
         return 0.0
     return 1.0 - ((distance_m - ideal_m) / (max_m - ideal_m))
+
+
+def normalize_high(value: float, poor: float, good: float) -> float:
+    if not np.isfinite(value):
+        return 0.0
+    if value <= poor:
+        return 0.0
+    if value >= good:
+        return 1.0
+    return (value - poor) / (good - poor)
+
+
+def clamp01(value: float) -> float:
+    if not np.isfinite(value):
+        return 0.0
+    return max(0.0, min(1.0, float(value)))
+
+
+def numeric_attr(attributes: dict, aliases: Iterable[str], default: float = np.nan) -> float:
+    for alias in aliases:
+        if alias in attributes:
+            try:
+                value = float(attributes[alias])
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value):
+                return value
+    return default
+
+
+def text_attr(attributes: dict, aliases: Iterable[str], default: str = "") -> str:
+    for alias in aliases:
+        value = attributes.get(alias)
+        if value is not None and str(value).strip():
+            return str(value)
+    return default
+
+
+def regional_groundwater_profile(lat: float, lon: float) -> GroundwaterRegionalProfile:
+    if lon > 51.44 and lat < 25.34:
+        return GROUNDWATER_REGIONAL_PROFILES["Coastal saline / industrial fringe"]
+    if lat >= 25.40 and lon <= 51.48:
+        return GROUNDWATER_REGIONAL_PROFILES["Northern aquifer / farm belt"]
+    if lat < 25.05 or lon < 50.92:
+        return GROUNDWATER_REGIONAL_PROFILES["Southern / southwestern stressed aquifer"]
+    return GROUNDWATER_REGIONAL_PROFILES["Central Qatar / transition aquifer"]
+
+
+def salinity_score(tds_mg_l: float) -> float:
+    # Classes follow Qatar MAR/RWH studies using Ministry of Environment / Schlumberger 2009 salinity ranges.
+    if not np.isfinite(tds_mg_l):
+        return 0.35
+    if tds_mg_l <= 1_000.0:
+        return 1.0
+    if tds_mg_l <= 2_500.0:
+        return 0.82
+    if tds_mg_l <= 4_000.0:
+        return 0.62
+    if tds_mg_l <= 5_000.0:
+        return 0.42
+    return max(0.08, 0.42 - (tds_mg_l - 5_000.0) / 10_000.0)
+
+
+def water_level_score(depth_m_bgl: float) -> float:
+    if not np.isfinite(depth_m_bgl):
+        return 0.45
+    return 0.20 + 0.80 * normalize_distance(depth_m_bgl, 18.0, 65.0)
+
+
+def yield_score(well_yield_m3_day: float) -> float:
+    if not np.isfinite(well_yield_m3_day):
+        return 0.40
+    return normalize_high(well_yield_m3_day, 60.0, 420.0)
+
+
+def permit_score(permitted_abstraction_m3_year: float, source_confidence: float) -> float:
+    if not np.isfinite(permitted_abstraction_m3_year):
+        return 0.42 + 0.20 * source_confidence
+    return normalize_high(permitted_abstraction_m3_year, 18_000.0, 90_000.0)
+
+
+def transmissivity_score(transmissivity_m2_day: float) -> float:
+    if not np.isfinite(transmissivity_m2_day):
+        return 0.42
+    return normalize_high(transmissivity_m2_day, 25.0, 500.0)
+
+
+def storativity_score(storativity: float) -> float:
+    if not np.isfinite(storativity) or storativity <= 0.0:
+        return 0.40
+    log_value = math.log10(storativity)
+    return clamp01((log_value - math.log10(1e-5)) / (math.log10(1e-1) - math.log10(1e-5)))
+
+
+def aquifer_stress_score(stress_ratio: float) -> float:
+    if not np.isfinite(stress_ratio):
+        stress_ratio = NATIONAL_GW_STRESS_RATIO
+    if stress_ratio <= 1.0:
+        return 1.0
+    if stress_ratio >= 5.0:
+        return 0.12
+    return 1.0 - ((stress_ratio - 1.0) / 4.0) * 0.88
+
+
+def groundwater_quality_model(lat: float, lon: float, nearest_info: dict) -> dict:
+    attributes = nearest_info.get("attributes", {})
+    profile = regional_groundwater_profile(lat, lon)
+    confidence = numeric_attr(attributes, ["groundwater_confidence", "confidence"], profile.confidence)
+
+    tds = numeric_attr(attributes, ["tds_mg_l", "TDS_MG_L", "TDS", "tds", "salinity_mg_l"], profile.tds_mg_l)
+    water_level = numeric_attr(attributes, ["water_level_m_bgl", "depth_to_water_m", "gw_level_m_bgl", "waterlevel_m"], profile.water_level_m_bgl)
+    well_yield = numeric_attr(attributes, ["well_yield_m3_day", "yield_m3_day", "safe_yield_m3_day", "pump_test_m3_day"], profile.well_yield_m3_day)
+    permit = numeric_attr(attributes, ["permitted_abstraction_m3_year", "permit_m3_year", "allocation_m3_year"], profile.permitted_abstraction_m3_year)
+    transmissivity = numeric_attr(attributes, ["transmissivity_m2_day", "transmissivity", "tm_m2_day"], profile.transmissivity_m2_day)
+    storativity = numeric_attr(attributes, ["storativity", "storage_coefficient"], profile.storativity)
+    stress_ratio = numeric_attr(attributes, ["aquifer_stress_ratio", "stress_ratio", "abstraction_safe_yield_ratio"], profile.aquifer_stress_ratio)
+
+    exact_fields = sum(
+        np.isfinite(numeric_attr(attributes, [field], np.nan))
+        for field in GW_REQUIRED_FIELDS
+    )
+    source_tier = text_attr(attributes, ["source_tier", "tier"], profile.source_tier)
+    source_note = text_attr(attributes, ["source_note", "source"], profile.source_note)
+
+    distance_score = normalize_distance(float(nearest_info["distance_m"]), 2_000.0, 18_000.0)
+    quality = salinity_score(tds)
+    depth = water_level_score(water_level)
+    quantity = yield_score(well_yield)
+    permission = permit_score(permit, confidence)
+    capacity = 0.62 * transmissivity_score(transmissivity) + 0.38 * storativity_score(storativity)
+    stress = aquifer_stress_score(stress_ratio)
+    raw_score = (
+        distance_score * 0.18
+        + quality * 0.20
+        + depth * 0.10
+        + quantity * 0.14
+        + permission * 0.10
+        + capacity * 0.13
+        + stress * 0.15
+    )
+    data_completeness = exact_fields / len(GW_REQUIRED_FIELDS)
+    uncertainty_penalty = 0.86 + 0.14 * max(data_completeness, confidence)
+    composite = clamp01(raw_score * uncertainty_penalty)
+
+    return {
+        "score": composite,
+        "distance_score": distance_score,
+        "salinity_score": quality,
+        "water_level_score": depth,
+        "well_yield_score": quantity,
+        "permit_score": permission,
+        "capacity_score": capacity,
+        "stress_score": stress,
+        "tds_mg_l": tds,
+        "water_level_m_bgl": water_level,
+        "well_yield_m3_day": well_yield,
+        "permitted_abstraction_m3_year": permit,
+        "transmissivity_m2_day": transmissivity,
+        "storativity": storativity,
+        "aquifer_stress_ratio": stress_ratio,
+        "aquifer_zone": text_attr(attributes, ["aquifer_zone"], profile.zone),
+        "source_tier": source_tier,
+        "source_note": source_note,
+        "confidence": confidence,
+        "data_completeness": data_completeness,
+    }
 
 
 def interpolate_climate(lat: float, lon: float) -> dict:
@@ -646,10 +986,31 @@ def calculate_suitability(lat: float, lon: float, weights: dict, layers: dict) -
             "landuse_score": 0.0,
             "grid_distance_m": float("inf"),
             "road_distance_m": float("inf"),
+            "groundwater_distance_m": float("inf"),
+            "groundwater_source": "Not applicable",
+            "groundwater_source_tier": "Not applicable",
+            "groundwater_aquifer_zone": "Not applicable",
+            "groundwater_tds_mg_l": np.nan,
+            "groundwater_level_m_bgl": np.nan,
+            "groundwater_well_yield_m3_day": np.nan,
+            "groundwater_permitted_abstraction_m3_year": np.nan,
+            "groundwater_transmissivity_m2_day": np.nan,
+            "groundwater_storativity": np.nan,
+            "groundwater_aquifer_stress_ratio": np.nan,
+            "groundwater_confidence": 0.0,
+            "groundwater_data_completeness": 0.0,
+            "groundwater_distance_score": 0.0,
+            "groundwater_salinity_score": 0.0,
+            "groundwater_level_score": 0.0,
+            "groundwater_yield_score": 0.0,
+            "groundwater_permit_score": 0.0,
+            "groundwater_capacity_score": 0.0,
+            "groundwater_stress_score": 0.0,
             "excluded_distance_m": float("inf"),
             "climate_score": 0.0,
             "grid_score": 0.0,
             "road_score": 0.0,
+            "groundwater_score": 0.0,
             "constraint_score": 0.0,
         }
 
@@ -657,11 +1018,15 @@ def calculate_suitability(lat: float, lon: float, weights: dict, layers: dict) -
     lu = point_landuse(point, layers["landuse"])
     grid_distance = point_distance_m(point, layers["power"])
     road_distance = point_distance_m(point, layers["roads"])
+    groundwater_info = nearest_feature_info(point, layers["groundwater_wells"])
+    groundwater_distance = groundwater_info["distance_m"]
+    groundwater_model = groundwater_quality_model(lat, lon, groundwater_info)
     excluded_distance = point_distance_m(point, layers["excluded_landuse"])
 
     climate_score = max(0.0, min(1.0, 1.0 - (climate["rh_pct"] - 38.0) / 35.0))
     grid_score = normalize_distance(grid_distance, 800.0, 28_000.0)
     road_score = normalize_distance(road_distance, 1_200.0, 24_000.0)
+    groundwater_score = groundwater_model["score"]
     constraint_score = min(1.0, excluded_distance / 1500.0)
     if lu["greenhouse_ok"]:
         if lu["landuse"] == "Agricultural":
@@ -677,6 +1042,7 @@ def calculate_suitability(lat: float, lon: float, weights: dict, layers: dict) -
         climate_score * weights["climate"]
         + grid_score * weights["grid"]
         + road_score * weights["logistics"]
+        + groundwater_score * weights["groundwater"]
         + landuse_score * weights["landuse"]
         + constraint_score * weights["constraints"]
     )
@@ -702,10 +1068,32 @@ def calculate_suitability(lat: float, lon: float, weights: dict, layers: dict) -
         "landuse_name": lu["name"],
         "grid_distance_m": grid_distance,
         "road_distance_m": road_distance,
+        "groundwater_distance_m": groundwater_distance,
+        "groundwater_source": groundwater_info["source"],
+        "nearest_groundwater": groundwater_info["name"],
+        "groundwater_source_tier": groundwater_model["source_tier"],
+        "groundwater_aquifer_zone": groundwater_model["aquifer_zone"],
+        "groundwater_tds_mg_l": groundwater_model["tds_mg_l"],
+        "groundwater_level_m_bgl": groundwater_model["water_level_m_bgl"],
+        "groundwater_well_yield_m3_day": groundwater_model["well_yield_m3_day"],
+        "groundwater_permitted_abstraction_m3_year": groundwater_model["permitted_abstraction_m3_year"],
+        "groundwater_transmissivity_m2_day": groundwater_model["transmissivity_m2_day"],
+        "groundwater_storativity": groundwater_model["storativity"],
+        "groundwater_aquifer_stress_ratio": groundwater_model["aquifer_stress_ratio"],
+        "groundwater_confidence": groundwater_model["confidence"],
+        "groundwater_data_completeness": groundwater_model["data_completeness"],
+        "groundwater_distance_score": round(groundwater_model["distance_score"] * 100.0, 1),
+        "groundwater_salinity_score": round(groundwater_model["salinity_score"] * 100.0, 1),
+        "groundwater_level_score": round(groundwater_model["water_level_score"] * 100.0, 1),
+        "groundwater_yield_score": round(groundwater_model["well_yield_score"] * 100.0, 1),
+        "groundwater_permit_score": round(groundwater_model["permit_score"] * 100.0, 1),
+        "groundwater_capacity_score": round(groundwater_model["capacity_score"] * 100.0, 1),
+        "groundwater_stress_score": round(groundwater_model["stress_score"] * 100.0, 1),
         "excluded_distance_m": excluded_distance,
         "climate_score": round(climate_score * 100.0, 1),
         "grid_score": round(grid_score * 100.0, 1),
         "road_score": round(road_score * 100.0, 1),
+        "groundwater_score": round(groundwater_score * 100.0, 1),
         "landuse_score": round(landuse_score * 100.0, 1),
         "constraint_score": round(constraint_score * 100.0, 1),
     }
@@ -736,6 +1124,7 @@ def build_heatmap_runtime(weights: dict, layers: dict) -> gpd.GeoDataFrame:
                     "score": result["score"],
                     "status": result["status"],
                     "landuse": result["landuse"],
+                    "groundwater_km": round(result["groundwater_distance_m"] / 1000.0, 1) if np.isfinite(result["groundwater_distance_m"]) else None,
                     "is_excluded": result["is_excluded"],
                     "geometry": point.buffer(0.018),
                 }
@@ -759,7 +1148,27 @@ def add_geojson(map_object: folium.Map, gdf: gpd.GeoDataFrame, name: str, color:
     ).add_to(map_object)
 
 
-def build_map(lat: float, lon: float, weights: dict, layers: dict, show_heatmap: bool, show_infra: bool, show_landuse: bool) -> folium.Map:
+def add_groundwater_wells(map_object: folium.Map, wells: gpd.GeoDataFrame) -> None:
+    if wells.empty:
+        return
+    group = folium.FeatureGroup(name="Groundwater / hydrogeological stations", show=True)
+    for _, row in wells.iterrows():
+        geometry = row.geometry
+        if geometry is None or geometry.is_empty:
+            continue
+        folium.CircleMarker(
+            location=[geometry.y, geometry.x],
+            radius=5,
+            color="#0f766e",
+            fill=True,
+            fill_color="#14b8a6",
+            fill_opacity=0.85,
+            tooltip=f"{row.get('name', 'Groundwater feature')} | {row.get('subtype', 'HydrogeologicalStation')}",
+        ).add_to(group)
+    group.add_to(map_object)
+
+
+def build_map(lat: float, lon: float, weights: dict, layers: dict, show_heatmap: bool, show_infra: bool, show_landuse: bool, show_groundwater: bool) -> folium.Map:
     map_object = folium.Map(location=[25.3548, 51.1839], zoom_start=9, tiles="CartoDB positron", control_scale=True)
     folium.Rectangle(
         bounds=[[24.48, 50.66], [26.22, 51.72]],
@@ -778,7 +1187,7 @@ def build_map(lat: float, lon: float, weights: dict, layers: dict, show_heatmap:
         folium.GeoJson(
             heatmap,
             name="Feasible suitability heatmap",
-            tooltip=folium.GeoJsonTooltip(fields=["score", "status", "landuse"]),
+            tooltip=folium.GeoJsonTooltip(fields=["score", "status", "landuse", "groundwater_km"]),
             style_function=lambda feature: {
                 "fillColor": score_color(float(feature["properties"]["score"]), bool(feature["properties"]["is_excluded"])),
                 "color": score_color(float(feature["properties"]["score"]), bool(feature["properties"]["is_excluded"])),
@@ -796,6 +1205,9 @@ def build_map(lat: float, lon: float, weights: dict, layers: dict, show_heatmap:
     if show_infra:
         add_geojson(map_object, layers["power"], "Power grid proxy", "#c0262d", weight=4)
         add_geojson(map_object, layers["roads"], "Primary highways", "#2563eb", weight=4)
+
+    if show_groundwater:
+        add_groundwater_wells(map_object, layers["groundwater_wells"])
 
     marker_color = "red" if not QATAR_POLYGON.contains(Point(lon, lat)) else "green"
     marker_text = "Selected point - water/offshore" if marker_color == "red" else "Selected greenhouse site"
@@ -882,10 +1294,12 @@ st.markdown(
 power_lines = load_vector_layer("qatar_kahramaa_lines.geojson", "power")
 roads = load_vector_layer("qatar_ashghal_roads.geojson", "roads")
 landuse = load_vector_layer("qatar_landuse.geojson", "landuse")
+groundwater_wells = load_groundwater_wells()
 allowed_landuse_gdf, excluded_landuse_gdf = split_landuse(landuse)
 layers = {
     "power": power_lines,
     "roads": roads,
+    "groundwater_wells": groundwater_wells,
     "landuse": landuse,
     "allowed_landuse": allowed_landuse_gdf,
     "excluded_landuse": excluded_landuse_gdf,
@@ -901,15 +1315,17 @@ st.caption("Land, water, land-use, crop-technology optimisation, and greenhouse 
 with st.sidebar:
     st.header("Suitability Weights")
     w_climate = st.slider("Low-humidity microclimate", 0.0, 1.0, 0.26, 0.01)
-    w_grid = st.slider("Power grid proximity", 0.0, 1.0, 0.18, 0.01)
-    w_logistics = st.slider("Highway logistics", 0.0, 1.0, 0.14, 0.01)
+    w_grid = st.slider("Power grid proximity", 0.0, 1.0, 0.16, 0.01)
+    w_logistics = st.slider("Highway logistics", 0.0, 1.0, 0.12, 0.01)
+    w_groundwater = st.slider("Groundwater source suitability", 0.0, 1.0, 0.14, 0.01)
     w_landuse = st.slider("Permitted land use", 0.0, 1.0, 0.32, 0.01)
     w_constraints = st.slider("Buffer from exclusions", 0.0, 1.0, 0.10, 0.01)
-    total_weight = max(w_climate + w_grid + w_logistics + w_landuse + w_constraints, 0.01)
+    total_weight = max(w_climate + w_grid + w_logistics + w_groundwater + w_landuse + w_constraints, 0.01)
     weights = {
         "climate": w_climate / total_weight,
         "grid": w_grid / total_weight,
         "logistics": w_logistics / total_weight,
+        "groundwater": w_groundwater / total_weight,
         "landuse": w_landuse / total_weight,
         "constraints": w_constraints / total_weight,
     }
@@ -923,6 +1339,7 @@ with st.sidebar:
     show_heatmap = st.toggle("Suitability heatmap", value=True)
     show_landuse = st.toggle("Land-use layer", value=True)
     show_infra = st.toggle("Infrastructure layers", value=True)
+    show_groundwater = st.toggle("Groundwater wells", value=True)
 
 tab_map, tab_compare, tab_opt, tab_notes = st.tabs(["Suitability Map", "Crop-Tech Comparison", "Investment & Optimisation", "Model Notes"])
 
@@ -936,7 +1353,7 @@ with tab_map:
     map_col, metric_col = st.columns([2.15, 0.85], gap="medium")
     with map_col:
         st.subheader("National Feasibility Map")
-        map_object = build_map(lat, lon, weights, layers, show_heatmap, show_infra, show_landuse)
+        map_object = build_map(lat, lon, weights, layers, show_heatmap, show_infra, show_landuse, show_groundwater)
         map_data = st_folium(map_object, height=760, use_container_width=True)
         if map_data and map_data.get("last_clicked"):
             st.session_state.selected_lat = map_data["last_clicked"]["lat"]
@@ -960,8 +1377,27 @@ with tab_map:
         c1, c2 = st.columns(2)
         c1.metric("Grid distance", format_distance(float(suitability["grid_distance_m"])))
         c2.metric("Road distance", format_distance(float(suitability["road_distance_m"])))
+        c1.metric("Groundwater distance", format_distance(float(suitability["groundwater_distance_m"])))
+        c2.metric("Groundwater score", f"{suitability['groundwater_score']:.0f}/100")
         c1.metric("Land-use score", f"{suitability['landuse_score']:.0f}/100")
         c2.metric("Exclusion buffer", format_distance(float(suitability["excluded_distance_m"])))
+        st.caption(f"Nearest groundwater feature: {suitability.get('nearest_groundwater', 'Not available')}")
+        st.caption(f"Groundwater evidence tier: {suitability.get('groundwater_source_tier', 'Not available')}")
+
+        with st.expander("Groundwater quality, quantity and aquifer stress", expanded=False):
+            st.write(f"**Aquifer zone:** {suitability.get('groundwater_aquifer_zone', 'Not available')}")
+            gw_cols = st.columns(2)
+            gw_cols[0].metric("TDS / salinity proxy", "N/A" if not np.isfinite(suitability["groundwater_tds_mg_l"]) else f"{suitability['groundwater_tds_mg_l']:,.0f} mg/L")
+            gw_cols[1].metric("Water level", "N/A" if not np.isfinite(suitability["groundwater_level_m_bgl"]) else f"{suitability['groundwater_level_m_bgl']:.0f} m bgl")
+            gw_cols[0].metric("Well yield proxy", "N/A" if not np.isfinite(suitability["groundwater_well_yield_m3_day"]) else f"{suitability['groundwater_well_yield_m3_day']:,.0f} m³/day")
+            gw_cols[1].metric("Permit allocation", "Missing" if not np.isfinite(suitability["groundwater_permitted_abstraction_m3_year"]) else f"{suitability['groundwater_permitted_abstraction_m3_year']:,.0f} m³/yr")
+            gw_cols[0].metric("Transmissivity", "N/A" if not np.isfinite(suitability["groundwater_transmissivity_m2_day"]) else f"{suitability['groundwater_transmissivity_m2_day']:,.0f} m²/day")
+            gw_cols[1].metric("Aquifer stress", "N/A" if not np.isfinite(suitability["groundwater_aquifer_stress_ratio"]) else f"{suitability['groundwater_aquifer_stress_ratio']:.1f}x safe yield")
+            st.progress(float(max(0.0, min(1.0, suitability["groundwater_confidence"]))))
+            st.caption(
+                f"Confidence {suitability['groundwater_confidence']:.0%}; exact field completeness "
+                f"{suitability['groundwater_data_completeness']:.0%}. {GW_SOURCE_SUMMARY}"
+            )
 
         default_report = analyze_location(lat, lon, CROP_DATABASE["Tomato - truss/cherry"], GREENHOUSE_TECHS["Fan-pad evaporative"], int(area_m2), transmissivity, recycle, landuse)
         with st.expander("Site report: tomato + fan-pad", expanded=not suitability["is_excluded"]):
@@ -978,11 +1414,12 @@ with tab_map:
 
     score_df = pd.DataFrame(
         {
-            "Factor": ["Microclimate", "Power grid", "Highway logistics", "Permitted land use", "Exclusion buffer"],
+            "Factor": ["Microclimate", "Power grid", "Highway logistics", "Groundwater", "Permitted land use", "Exclusion buffer"],
             "Score": [
                 suitability["climate_score"],
                 suitability["grid_score"],
                 suitability["road_score"],
+                suitability["groundwater_score"],
                 suitability["landuse_score"],
                 suitability["constraint_score"],
             ],
@@ -990,6 +1427,22 @@ with tab_map:
     )
     st.subheader("Suitability Score Breakdown")
     st.bar_chart(score_df, x="Factor", y="Score", height=270)
+    gw_breakdown = pd.DataFrame(
+        {
+            "Groundwater component": ["Distance", "TDS/salinity", "Water level", "Well yield", "Permit", "Aquifer capacity", "Aquifer stress"],
+            "Score": [
+                suitability["groundwater_distance_score"],
+                suitability["groundwater_salinity_score"],
+                suitability["groundwater_level_score"],
+                suitability["groundwater_yield_score"],
+                suitability["groundwater_permit_score"],
+                suitability["groundwater_capacity_score"],
+                suitability["groundwater_stress_score"],
+            ],
+        }
+    )
+    st.subheader("Groundwater Composite Score Breakdown")
+    st.bar_chart(gw_breakdown, x="Groundwater component", y="Score", height=260)
 
 with tab_compare:
     st.subheader("Compare Crop and Greenhouse Technology Packages")
@@ -1083,6 +1536,13 @@ with tab_notes:
         gridded climate data for engineering design.
 
         **Water model:** irrigation is estimated from a FAO-56 style crop coefficient approach using simplified Hargreaves ET0.
+
+        **Groundwater model:** groundwater is now a composite source-suitability score, not a distance-only layer.
+        The score combines distance to the nearest groundwater feature, TDS/salinity, groundwater level, well-yield or
+        quantity proxy, permitted abstraction if available, transmissivity, storativity, and aquifer stress relative to
+        safe yield. Exact fields in `qatar_groundwater_wells.geojson` override defaults when present. If exact fields
+        are missing, the Atlas uses source-tiered national screening proxies from public/peer-reviewed Qatar groundwater
+        sources and applies a confidence/completeness penalty.
 
         **Cooling and microclimate model:** peak cooling combines solar gain, sensible heat, and a humidity penalty.
         A deterministic greenhouse microclimate engine estimates indoor equilibrium temperature, RH, ventilation rate,
