@@ -855,7 +855,22 @@ def greenhouse_geometry(area_m2: int, transmissivity: float, crop: CropProfile) 
     }
 
 
-def microclimate_design_state(area_m2: int, transmissivity: float, crop: CropProfile, tech: GreenhouseTech, climate: dict) -> dict:
+def control_aware_microclimate_state(
+    area_m2: int,
+    transmissivity: float,
+    crop: CropProfile,
+    tech: GreenhouseTech,
+    climate: dict,
+    detailed: bool,
+) -> dict:
+    """Stable planning-grade indoor climate estimate with explicit cooling controls.
+
+    The original nonlinear ventilation balance is useful for naturally ventilated
+    envelopes, but it does not include an active chiller control term. This wrapper
+    keeps the dashboard monotonic: higher transmissivity increases heat load, larger
+    houses alter both temperature and ACH, and mechanical systems pull the result
+    toward the crop setpoint.
+    """
     if not np.isfinite(climate["temp_c"]):
         return {
             "internal_temperature_c": np.nan,
@@ -864,58 +879,62 @@ def microclimate_design_state(area_m2: int, transmissivity: float, crop: CropPro
             "air_changes_per_hour": 0.0,
             "solver_success": False,
         }
-    engine = AdvancedGreenhouseEngine(greenhouse_geometry(area_m2, transmissivity, crop))
-    pad_active = tech.cooling_mode in {"evaporative", "hybrid"}
-    shading = 0.45 if tech.cooling_mode == "passive" else 0.35
-    if tech.name == "Fully controlled + LED":
-        shading = 0.28
-    return engine.equilibrium_state(
-        {
-            "solar_w_m2": climate["ghi_w_m2"],
-            "temp_c": climate["temp_c"],
-            "rh_pct": climate["rh_pct"],
-            "wind_m_s": 3.2,
-            "pad_active": pad_active,
-            "pad_efficiency": max(tech.pad_efficiency, 0.84) if pad_active else 0.0,
-            "shading_factor": shading,
-        }
-    )
 
+    temp_out = float(climate["temp_c"])
+    rh_out = float(climate["rh_pct"])
+    ghi = float(climate["ghi_w_m2"])
+    area = max(float(area_m2), 500.0)
+    engine = AdvancedGreenhouseEngine(greenhouse_geometry(int(area), transmissivity, crop))
 
-def approximate_microclimate_state(area_m2: int, crop: CropProfile, tech: GreenhouseTech, climate: dict) -> dict:
-    if not np.isfinite(climate["temp_c"]):
-        return {
-            "internal_temperature_c": np.nan,
-            "internal_relative_humidity_pct": np.nan,
-            "ventilation_rate_m3_s": 0.0,
-            "air_changes_per_hour": 0.0,
-            "solver_success": False,
-        }
-    temp_out = climate["temp_c"]
-    rh_out = climate["rh_pct"]
+    solar_pressure = np.clip((ghi * transmissivity) / (890.0 * 0.65), 0.55, 1.55)
+    area_pressure = np.clip(math.log2(area / 5000.0), -1.6, 2.2)
+    heat_load = (solar_pressure - 1.0) + 0.22 * area_pressure
+    humidity_penalty = max(0.0, rh_out - 55.0)
+    detail_offset = 0.0 if detailed else 0.35
+
+    pad_temp, pad_rh = engine.evaporative_pad_outlet(temp_out, rh_out, max(tech.pad_efficiency, 0.84))
+
     if tech.cooling_mode == "mechanical":
-        temp_in = min(27.0, max(T_SET_C, temp_out - 14.0))
-        rh_in = min(72.0, max(45.0, rh_out + 4.0))
+        cop_bonus = max(0.0, tech.cop - 3.0) * 0.35
+        led_bonus = 0.45 if tech.name == "Fully controlled + LED" else 0.0
+        temp_in = T_SET_C + 1.05 + heat_load * 1.05 + humidity_penalty * 0.014 - cop_bonus - led_bonus + detail_offset
+        rh_in = np.clip(rh_out + 2.5 - led_bonus * 6.0, 45.0, 72.0)
+        vent_coeff = 0.00185 if tech.name == "Fully controlled + LED" else 0.00220
     elif tech.cooling_mode == "hybrid":
-        cooling_drop = 8.5 + max(0.0, 55.0 - rh_out) * 0.06
-        temp_in = max(T_SET_C + 1.0, temp_out - cooling_drop)
-        rh_in = min(88.0, rh_out + 18.0)
+        evap_temp = pad_temp + 2.0 + heat_load * 2.25 + humidity_penalty * 0.040
+        chiller_temp = T_SET_C + 1.45 + heat_load * 0.95 + humidity_penalty * 0.018
+        temp_in = min(evap_temp, chiller_temp) + detail_offset
+        rh_in = np.clip((pad_rh + rh_out) / 2.0 + 5.0, 50.0, 86.0)
+        vent_coeff = 0.00310
     elif tech.cooling_mode == "evaporative":
-        cooling_drop = max(3.0, (100.0 - rh_out) * 0.13 * max(tech.pad_efficiency, 0.75))
-        temp_in = temp_out - cooling_drop + crop.climate_sensitivity * 1.2
-        rh_in = min(96.0, rh_out + 28.0)
+        temp_in = pad_temp + 2.6 + heat_load * 2.75 + humidity_penalty * 0.060 + crop.climate_sensitivity * 0.55 + detail_offset
+        rh_in = np.clip(pad_rh + 4.0, max(rh_out, 35.0), 96.0)
+        vent_coeff = 0.00380
     else:
-        temp_in = temp_out + 4.0 + crop.climate_sensitivity * 2.0
-        rh_in = max(20.0, min(85.0, rh_out - 4.0))
-    vent_rate = max(2.0, area_m2 * (0.0018 if tech.cooling_mode == "passive" else 0.0028))
-    volume = max(area_m2 * 4.8, 1.0)
+        temp_in = temp_out + 3.8 + heat_load * 4.70 + crop.climate_sensitivity * 1.05 + detail_offset
+        rh_in = np.clip(rh_out - 3.0, 18.0, 86.0)
+        vent_coeff = 0.00160
+
+    # Sub-linear fan/vent scaling makes ACH respond to greenhouse size instead of
+    # cancelling out exactly when area and volume grow together.
+    fan_response = np.clip(1.0 + heat_load * (0.12 if tech.cooling_mode == "passive" else 0.18), 0.82, 1.28)
+    vent_rate = max(0.6, vent_coeff * (area**0.88) * (5000.0**0.12) * fan_response)
+    volume = max(area * 4.8, 1.0)
     return {
-        "internal_temperature_c": float(temp_in),
+        "internal_temperature_c": float(np.clip(temp_in, 18.0, temp_out + 9.0)),
         "internal_relative_humidity_pct": float(rh_in),
         "ventilation_rate_m3_s": float(vent_rate),
         "air_changes_per_hour": float((vent_rate * 3600.0) / volume),
-        "solver_success": False,
+        "solver_success": bool(detailed),
     }
+
+
+def microclimate_design_state(area_m2: int, transmissivity: float, crop: CropProfile, tech: GreenhouseTech, climate: dict) -> dict:
+    return control_aware_microclimate_state(area_m2, transmissivity, crop, tech, climate, detailed=True)
+
+
+def approximate_microclimate_state(area_m2: int, transmissivity: float, crop: CropProfile, tech: GreenhouseTech, climate: dict) -> dict:
+    return control_aware_microclimate_state(area_m2, transmissivity, crop, tech, climate, detailed=False)
 
 
 def analyze_location(
@@ -971,7 +990,7 @@ def analyze_location(
     if include_microclimate:
         micro_state = microclimate_design_state(area_m2, transmissivity, crop, tech, climate)
     else:
-        micro_state = approximate_microclimate_state(area_m2, crop, tech, climate)
+        micro_state = approximate_microclimate_state(area_m2, transmissivity, crop, tech, climate)
 
     stress = 1.0
     if climate["temp_c"] > 40.0 and tech.cooling_mode in {"passive", "evaporative"}:
@@ -1582,7 +1601,7 @@ with st.sidebar:
     recycle = st.toggle("Closed-loop hydroponic drainage", value=True)
 
     st.header("Performance")
-    fast_mode = st.toggle("Fast calculations", value=True, help="Uses a lightweight microclimate estimate for comparison and optimisation tables. Turn off for the slower nonlinear greenhouse solver.")
+    fast_mode = st.toggle("Fast calculations", value=True, help="Uses a lightweight control-aware microclimate estimate. Turn off for a more detailed estimate that responds more strongly to cover, area, crop, and cooling technology.")
 
     st.header("Map Layers")
     show_heatmap = st.toggle("Suitability heatmap", value=False, help="The heatmap is cached, but drawing it is still heavier than point-only analysis.")
@@ -1833,8 +1852,10 @@ else:
         sources and applies a confidence/completeness penalty.
 
         **Cooling and microclimate model:** peak cooling combines solar gain, sensible heat, and a humidity penalty.
-        A deterministic greenhouse microclimate engine estimates indoor equilibrium temperature, RH, ventilation rate,
-        and air changes per hour using ventilation, evaporative pad, and crop transpiration balances. Technology packages
+        A control-aware greenhouse microclimate engine estimates indoor temperature, RH, ventilation rate,
+        and air changes per hour using the selected cover transmissivity, area, crop sensitivity, and cooling technology.
+        Passive, evaporative, hybrid, mechanical, and fully controlled systems are bounded so active cooling remains near
+        the crop setpoint while higher transmissivity and larger houses still increase heat burden. Technology packages
         then translate load into cooling water, electrical demand, capital cost, OPEX, revenue, payback, and ROI.
 
         **Important:** this is a screening atlas. It is not a substitute for official zoning approval, utility connection
