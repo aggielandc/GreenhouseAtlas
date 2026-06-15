@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -46,6 +47,7 @@ CGIS_GROUNDWATER_WELLS_URL = (
     "&outFields=OBJECTID,SUBTYPEDESCRIPTION,LIFECYCLESTATUS,ASSETID,DATASOURCE"
     "&returnGeometry=true&f=geojson&outSR=4326"
 )
+ENABLE_REMOTE_GIS = os.environ.get("GREENHOUSE_ATLAS_REMOTE_GIS", "0") == "1"
 
 
 QATAR_POLYGON = Polygon(
@@ -550,18 +552,19 @@ def load_groundwater_wells() -> gpd.GeoDataFrame:
         wells["name"] = wells.get("name", wells.get("ASSETID", wells.index.astype(str)))
         return wells
 
-    try:
-        wells = gpd.read_file(CGIS_GROUNDWATER_WELLS_URL).to_crs(QATAR_CRS)
-        if not wells.empty:
-            wells["name"] = wells.get("ASSETID", wells["OBJECTID"].astype(str) if "OBJECTID" in wells.columns else wells.index.astype(str))
-            wells["subtype"] = wells.get("SUBTYPEDESCRIPTION", "HydrogeologicalStation")
-            wells["source"] = "CGIS Qatar Vector/Water WATER.Facility HydrogeologicalStation"
-            return wells
-    except Exception:
-        pass
+    if ENABLE_REMOTE_GIS:
+        try:
+            wells = gpd.read_file(CGIS_GROUNDWATER_WELLS_URL).to_crs(QATAR_CRS)
+            if not wells.empty:
+                wells["name"] = wells.get("ASSETID", wells["OBJECTID"].astype(str) if "OBJECTID" in wells.columns else wells.index.astype(str))
+                wells["subtype"] = wells.get("SUBTYPEDESCRIPTION", "HydrogeologicalStation")
+                wells["source"] = "CGIS Qatar Vector/Water WATER.Facility HydrogeologicalStation"
+                return wells
+        except Exception:
+            pass
 
     fallback = synthetic_groundwater_wells()
-    fallback["source"] = "Synthetic fallback; replace with CGIS or official groundwater wells GeoJSON"
+    fallback["source"] = fallback["source"] + "; fast local proxy. Replace with official qatar_groundwater_wells.geojson"
     return fallback
 
 
@@ -878,7 +881,53 @@ def microclimate_design_state(area_m2: int, transmissivity: float, crop: CropPro
     )
 
 
-def analyze_location(lat: float, lon: float, crop: CropProfile, tech: GreenhouseTech, area_m2: int, transmissivity: float, recycle_drainage: bool, landuse: gpd.GeoDataFrame) -> dict:
+def approximate_microclimate_state(area_m2: int, crop: CropProfile, tech: GreenhouseTech, climate: dict) -> dict:
+    if not np.isfinite(climate["temp_c"]):
+        return {
+            "internal_temperature_c": np.nan,
+            "internal_relative_humidity_pct": np.nan,
+            "ventilation_rate_m3_s": 0.0,
+            "air_changes_per_hour": 0.0,
+            "solver_success": False,
+        }
+    temp_out = climate["temp_c"]
+    rh_out = climate["rh_pct"]
+    if tech.cooling_mode == "mechanical":
+        temp_in = min(27.0, max(T_SET_C, temp_out - 14.0))
+        rh_in = min(72.0, max(45.0, rh_out + 4.0))
+    elif tech.cooling_mode == "hybrid":
+        cooling_drop = 8.5 + max(0.0, 55.0 - rh_out) * 0.06
+        temp_in = max(T_SET_C + 1.0, temp_out - cooling_drop)
+        rh_in = min(88.0, rh_out + 18.0)
+    elif tech.cooling_mode == "evaporative":
+        cooling_drop = max(3.0, (100.0 - rh_out) * 0.13 * max(tech.pad_efficiency, 0.75))
+        temp_in = temp_out - cooling_drop + crop.climate_sensitivity * 1.2
+        rh_in = min(96.0, rh_out + 28.0)
+    else:
+        temp_in = temp_out + 4.0 + crop.climate_sensitivity * 2.0
+        rh_in = max(20.0, min(85.0, rh_out - 4.0))
+    vent_rate = max(2.0, area_m2 * (0.0018 if tech.cooling_mode == "passive" else 0.0028))
+    volume = max(area_m2 * 4.8, 1.0)
+    return {
+        "internal_temperature_c": float(temp_in),
+        "internal_relative_humidity_pct": float(rh_in),
+        "ventilation_rate_m3_s": float(vent_rate),
+        "air_changes_per_hour": float((vent_rate * 3600.0) / volume),
+        "solver_success": False,
+    }
+
+
+def analyze_location(
+    lat: float,
+    lon: float,
+    crop: CropProfile,
+    tech: GreenhouseTech,
+    area_m2: int,
+    transmissivity: float,
+    recycle_drainage: bool,
+    landuse: gpd.GeoDataFrame,
+    include_microclimate: bool = True,
+) -> dict:
     point = Point(lon, lat)
     if not QATAR_POLYGON.contains(point):
         result = off_land_result()
@@ -918,7 +967,10 @@ def analyze_location(lat: float, lon: float, crop: CropProfile, tech: Greenhouse
     lighting_mwh = tech.lighting_w_m2 * area_m2 * 2000.0 / 1_000_000.0
     total_energy_mwh = (cooling_energy_mwh + base_energy_mwh + lighting_mwh) * tech.energy_multiplier
     total_water_m3 = (irrigation_m3 + cooling_water_m3) * tech.water_multiplier
-    micro_state = microclimate_design_state(area_m2, transmissivity, crop, tech, climate)
+    if include_microclimate:
+        micro_state = microclimate_design_state(area_m2, transmissivity, crop, tech, climate)
+    else:
+        micro_state = approximate_microclimate_state(area_m2, crop, tech, climate)
 
     stress = 1.0
     if climate["temp_c"] > 40.0 and tech.cooling_mode in {"passive", "evaporative"}:
@@ -1111,14 +1163,24 @@ def score_color(score: float, excluded: bool = False) -> str:
     return "#b33430"
 
 
-def build_heatmap_runtime(weights: dict, layers: dict) -> gpd.GeoDataFrame:
+@st.cache_data(show_spinner=False, ttl=1800)
+def build_heatmap_runtime(weight_key: tuple[float, ...], resolution: int, _layers: dict) -> gpd.GeoDataFrame:
+    weights = {
+        "climate": weight_key[0],
+        "grid": weight_key[1],
+        "logistics": weight_key[2],
+        "groundwater": weight_key[3],
+        "landuse": weight_key[4],
+        "constraints": weight_key[5],
+    }
     records = []
-    for lat in np.linspace(24.68, 26.02, 24):
-        for lon in np.linspace(50.84, 51.55, 24):
+    cell_radius = 0.48 / max(resolution, 1)
+    for lat in np.linspace(24.68, 26.02, resolution):
+        for lon in np.linspace(50.84, 51.55, resolution):
             point = Point(lon, lat)
             if not QATAR_POLYGON.contains(point):
                 continue
-            result = calculate_suitability(lat, lon, weights, layers)
+            result = calculate_suitability(lat, lon, weights, _layers)
             records.append(
                 {
                     "score": result["score"],
@@ -1126,7 +1188,7 @@ def build_heatmap_runtime(weights: dict, layers: dict) -> gpd.GeoDataFrame:
                     "landuse": result["landuse"],
                     "groundwater_km": round(result["groundwater_distance_m"] / 1000.0, 1) if np.isfinite(result["groundwater_distance_m"]) else None,
                     "is_excluded": result["is_excluded"],
-                    "geometry": point.buffer(0.018),
+                    "geometry": point.buffer(cell_radius),
                 }
             )
     return gpd.GeoDataFrame(records, crs=QATAR_CRS)
@@ -1168,7 +1230,17 @@ def add_groundwater_wells(map_object: folium.Map, wells: gpd.GeoDataFrame) -> No
     group.add_to(map_object)
 
 
-def build_map(lat: float, lon: float, weights: dict, layers: dict, show_heatmap: bool, show_infra: bool, show_landuse: bool, show_groundwater: bool) -> folium.Map:
+def build_map(
+    lat: float,
+    lon: float,
+    weights: dict,
+    layers: dict,
+    show_heatmap: bool,
+    show_infra: bool,
+    show_landuse: bool,
+    show_groundwater: bool,
+    heatmap_resolution: int,
+) -> folium.Map:
     map_object = folium.Map(location=[25.3548, 51.1839], zoom_start=9, tiles="CartoDB positron", control_scale=True)
     folium.Rectangle(
         bounds=[[24.48, 50.66], [26.22, 51.72]],
@@ -1183,7 +1255,8 @@ def build_map(lat: float, lon: float, weights: dict, layers: dict, show_heatmap:
     add_geojson(map_object, boundary, "Qatar land mask", "#374151", fill_color="#f9fafb", fill_opacity=0.42)
 
     if show_heatmap:
-        heatmap = build_heatmap_runtime(weights, layers)
+        weight_key = tuple(round(weights[key], 4) for key in ["climate", "grid", "logistics", "groundwater", "landuse", "constraints"])
+        heatmap = build_heatmap_runtime(weight_key, heatmap_resolution, layers)
         folium.GeoJson(
             heatmap,
             name="Feasible suitability heatmap",
@@ -1235,11 +1308,20 @@ def years(value: float) -> str:
     return f"{value:.1f} years"
 
 
-def all_combinations(lat: float, lon: float, area_m2: int, transmissivity: float, recycle: bool, landuse: gpd.GeoDataFrame) -> pd.DataFrame:
+@st.cache_data(show_spinner=False, ttl=900)
+def all_combinations(
+    lat: float,
+    lon: float,
+    area_m2: int,
+    transmissivity: float,
+    recycle: bool,
+    include_microclimate: bool,
+    _landuse: gpd.GeoDataFrame,
+) -> pd.DataFrame:
     rows = []
     for crop in CROP_DATABASE.values():
         for tech in GREENHOUSE_TECHS.values():
-            rows.append(analyze_location(lat, lon, crop, tech, area_m2, transmissivity, recycle, landuse))
+            rows.append(analyze_location(lat, lon, crop, tech, area_m2, transmissivity, recycle, _landuse, include_microclimate=include_microclimate))
     return pd.DataFrame(rows)
 
 
@@ -1335,25 +1417,34 @@ with st.sidebar:
     transmissivity = st.slider("Cover transmissivity", 0.45, 0.85, 0.65, 0.01)
     recycle = st.toggle("Closed-loop hydroponic drainage", value=True)
 
+    st.header("Performance")
+    fast_mode = st.toggle("Fast calculations", value=True, help="Uses a lightweight microclimate estimate for comparison and optimisation tables. Turn off for the slower nonlinear greenhouse solver.")
+
     st.header("Map Layers")
-    show_heatmap = st.toggle("Suitability heatmap", value=True)
+    show_heatmap = st.toggle("Suitability heatmap", value=False, help="The heatmap is cached, but drawing it is still heavier than point-only analysis.")
+    heatmap_detail = st.selectbox("Heatmap detail", ["Fast", "Balanced", "Detailed"], index=0, disabled=not show_heatmap)
+    heatmap_resolution = {"Fast": 12, "Balanced": 16, "Detailed": 22}[heatmap_detail]
     show_landuse = st.toggle("Land-use layer", value=True)
     show_infra = st.toggle("Infrastructure layers", value=True)
     show_groundwater = st.toggle("Groundwater wells", value=True)
 
-tab_map, tab_compare, tab_opt, tab_notes = st.tabs(["Suitability Map", "Crop-Tech Comparison", "Investment & Optimisation", "Model Notes"])
+active_view = st.radio(
+    "View",
+    ["Suitability Map", "Crop-Tech Comparison", "Investment & Optimisation", "Model Notes"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
 
 lat = float(st.session_state.selected_lat)
 lon = float(st.session_state.selected_lon)
 suitability = calculate_suitability(lat, lon, weights, layers)
 climate = interpolate_climate(lat, lon)
-report_df = all_combinations(lat, lon, int(area_m2), transmissivity, recycle, landuse)
 
-with tab_map:
+if active_view == "Suitability Map":
     map_col, metric_col = st.columns([2.15, 0.85], gap="medium")
     with map_col:
         st.subheader("National Feasibility Map")
-        map_object = build_map(lat, lon, weights, layers, show_heatmap, show_infra, show_landuse, show_groundwater)
+        map_object = build_map(lat, lon, weights, layers, show_heatmap, show_infra, show_landuse, show_groundwater, heatmap_resolution)
         map_data = st_folium(map_object, height=760, use_container_width=True)
         if map_data and map_data.get("last_clicked"):
             st.session_state.selected_lat = map_data["last_clicked"]["lat"]
@@ -1399,7 +1490,17 @@ with tab_map:
                 f"{suitability['groundwater_data_completeness']:.0%}. {GW_SOURCE_SUMMARY}"
             )
 
-        default_report = analyze_location(lat, lon, CROP_DATABASE["Tomato - truss/cherry"], GREENHOUSE_TECHS["Fan-pad evaporative"], int(area_m2), transmissivity, recycle, landuse)
+        default_report = analyze_location(
+            lat,
+            lon,
+            CROP_DATABASE["Tomato - truss/cherry"],
+            GREENHOUSE_TECHS["Fan-pad evaporative"],
+            int(area_m2),
+            transmissivity,
+            recycle,
+            landuse,
+            include_microclimate=not fast_mode,
+        )
         with st.expander("Site report: tomato + fan-pad", expanded=not suitability["is_excluded"]):
             r1, r2 = st.columns(2)
             r1.metric("Annual yield", f"{default_report['yield_tons']:,.1f} t")
@@ -1444,7 +1545,7 @@ with tab_map:
     st.subheader("Groundwater Composite Score Breakdown")
     st.bar_chart(gw_breakdown, x="Groundwater component", y="Score", height=260)
 
-with tab_compare:
+elif active_view == "Crop-Tech Comparison":
     st.subheader("Compare Crop and Greenhouse Technology Packages")
     pair_cols = st.columns(3)
     selected_reports = []
@@ -1452,7 +1553,19 @@ with tab_compare:
         with col:
             crop_name = st.selectbox(f"Crop {idx + 1}", list(CROP_DATABASE.keys()), index=min(idx, len(CROP_DATABASE) - 1), key=f"crop_{idx}")
             tech_name = st.selectbox(f"Technology {idx + 1}", list(GREENHOUSE_TECHS.keys()), index=min(idx + 1, len(GREENHOUSE_TECHS) - 1), key=f"tech_{idx}")
-            selected_reports.append(analyze_location(lat, lon, CROP_DATABASE[crop_name], GREENHOUSE_TECHS[tech_name], int(area_m2), transmissivity, recycle, landuse))
+            selected_reports.append(
+                analyze_location(
+                    lat,
+                    lon,
+                    CROP_DATABASE[crop_name],
+                    GREENHOUSE_TECHS[tech_name],
+                    int(area_m2),
+                    transmissivity,
+                    recycle,
+                    landuse,
+                    include_microclimate=not fast_mode,
+                )
+            )
 
     comparison_df = pd.DataFrame(selected_reports)
     display_cols = [
@@ -1478,8 +1591,9 @@ with tab_compare:
         "text/csv",
     )
 
-with tab_opt:
+elif active_view == "Investment & Optimisation":
     st.subheader("Optimisation for Current Location")
+    report_df = all_combinations(lat, lon, int(area_m2), transmissivity, recycle, not fast_mode, landuse)
     objective = st.selectbox("Optimisation objective", ["Maximise net profit", "Minimise water use", "Minimise energy use", "Fastest payback", "Highest ROI"])
     feasible_only = st.toggle("Show feasible land-use sites only", value=True)
     opt_df = report_df.copy()
@@ -1517,7 +1631,7 @@ with tab_opt:
     else:
         st.info("PDF export needs the optional reportlab package. CSV export is available now.")
 
-with tab_notes:
+else:
     st.subheader("Scientific and GIS Notes")
     st.markdown(
         f"""
