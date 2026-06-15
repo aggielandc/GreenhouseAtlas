@@ -1419,6 +1419,10 @@ def years(value: float) -> str:
     return f"{value:.1f} years"
 
 
+def score_bar_dataframe(labels: list[str], scores: list[float]) -> pd.DataFrame:
+    return pd.DataFrame({"Score": scores}, index=labels)
+
+
 @st.cache_data(show_spinner=False, ttl=900)
 def all_combinations(
     lat: float,
@@ -1502,9 +1506,57 @@ layers = {
 if "selected_lat" not in st.session_state:
     st.session_state.selected_lat = 25.3548
     st.session_state.selected_lon = 51.1839
+if "tour_visible" not in st.session_state:
+    st.session_state.tour_visible = True
+if "tour_step" not in st.session_state:
+    st.session_state.tour_step = 0
 
 st.title("Qatar Greenhouse Atlas")
 st.caption("Land, water, land-use, crop-technology optimisation, and greenhouse investment screening.")
+
+TOUR_STEPS = [
+    (
+        "1. Start With The Map",
+        "Click any point inside Qatar. The green marker moves to that location and the selected-site panel updates immediately.",
+    ),
+    (
+        "2. Read The Selected-Site Panel",
+        "The right panel shows suitability, land use, climate, road/grid distance, groundwater score, and the score breakdown without scrolling.",
+    ),
+    (
+        "3. Use The Marker",
+        "Hover over the green marker for a compact summary. Click it for the full popup with groundwater, yield, water, energy, and profit.",
+    ),
+    (
+        "4. Turn Layers On Only When Needed",
+        "Use the sidebar to toggle land use, infrastructure, groundwater wells, and the heatmap. Keep the heatmap off for the fastest point analysis.",
+    ),
+    (
+        "5. Compare Or Optimise",
+        "Switch views at the top to compare crop-technology options or run investment optimisation for the selected point.",
+    ),
+]
+
+if st.session_state.tour_visible:
+    step_title, step_body = TOUR_STEPS[st.session_state.tour_step]
+    with st.container(border=True):
+        tour_cols = st.columns([0.14, 0.56, 0.10, 0.10, 0.10], vertical_alignment="center")
+        tour_cols[0].markdown(f"**Tour {st.session_state.tour_step + 1}/{len(TOUR_STEPS)}**")
+        tour_cols[1].markdown(f"**{step_title}**  \n{step_body}")
+        if tour_cols[2].button("Back", disabled=st.session_state.tour_step == 0, use_container_width=True):
+            st.session_state.tour_step = max(0, st.session_state.tour_step - 1)
+            st.rerun()
+        if tour_cols[3].button("Next", disabled=st.session_state.tour_step == len(TOUR_STEPS) - 1, use_container_width=True):
+            st.session_state.tour_step = min(len(TOUR_STEPS) - 1, st.session_state.tour_step + 1)
+            st.rerun()
+        if tour_cols[4].button("Skip", use_container_width=True):
+            st.session_state.tour_visible = False
+            st.rerun()
+else:
+    if st.button("Show quick tour"):
+        st.session_state.tour_visible = True
+        st.session_state.tour_step = 0
+        st.rerun()
 
 with st.sidebar:
     st.header("Suitability Weights")
@@ -1611,6 +1663,35 @@ if active_view == "Suitability Map":
         st.caption(f"Nearest groundwater feature: {suitability.get('nearest_groundwater', 'Not available')}")
         st.caption(f"Groundwater evidence tier: {suitability.get('groundwater_source_tier', 'Not available')}")
 
+        st.markdown("**Score Breakdown**")
+        score_compact_df = score_bar_dataframe(
+            ["Climate", "Grid", "Road", "Groundwater", "Land use", "Buffer"],
+            [
+                suitability["climate_score"],
+                suitability["grid_score"],
+                suitability["road_score"],
+                suitability["groundwater_score"],
+                suitability["landuse_score"],
+                suitability["constraint_score"],
+            ],
+        )
+        st.bar_chart(score_compact_df, height=185, horizontal=True, use_container_width=True)
+
+        with st.expander("Groundwater score details", expanded=True):
+            gw_compact_df = score_bar_dataframe(
+                ["Distance", "TDS", "Level", "Yield", "Permit", "Capacity", "Stress"],
+                [
+                    suitability["groundwater_distance_score"],
+                    suitability["groundwater_salinity_score"],
+                    suitability["groundwater_level_score"],
+                    suitability["groundwater_yield_score"],
+                    suitability["groundwater_permit_score"],
+                    suitability["groundwater_capacity_score"],
+                    suitability["groundwater_stress_score"],
+                ],
+            )
+            st.bar_chart(gw_compact_df, height=205, horizontal=True, use_container_width=True)
+
         with st.expander("Groundwater quality, quantity and aquifer stress", expanded=False):
             st.write(f"**Aquifer zone:** {suitability.get('groundwater_aquifer_zone', 'Not available')}")
             gw_cols = st.columns(2)
@@ -1637,38 +1718,6 @@ if active_view == "Suitability Map":
             st.metric("Capital investment", money(default_report["capital_qar"]))
             st.metric("Net annual profit", money(default_report["net_profit_qar"]))
             st.metric("Payback", years(default_report["payback_years"]), f"ROI {default_report['roi_percent']:.1f}%")
-
-    score_df = pd.DataFrame(
-        {
-            "Factor": ["Microclimate", "Power grid", "Highway logistics", "Groundwater", "Permitted land use", "Exclusion buffer"],
-            "Score": [
-                suitability["climate_score"],
-                suitability["grid_score"],
-                suitability["road_score"],
-                suitability["groundwater_score"],
-                suitability["landuse_score"],
-                suitability["constraint_score"],
-            ],
-        }
-    )
-    st.subheader("Suitability Score Breakdown")
-    st.bar_chart(score_df, x="Factor", y="Score", height=270)
-    gw_breakdown = pd.DataFrame(
-        {
-            "Groundwater component": ["Distance", "TDS/salinity", "Water level", "Well yield", "Permit", "Aquifer capacity", "Aquifer stress"],
-            "Score": [
-                suitability["groundwater_distance_score"],
-                suitability["groundwater_salinity_score"],
-                suitability["groundwater_level_score"],
-                suitability["groundwater_yield_score"],
-                suitability["groundwater_permit_score"],
-                suitability["groundwater_capacity_score"],
-                suitability["groundwater_stress_score"],
-            ],
-        }
-    )
-    st.subheader("Groundwater Composite Score Breakdown")
-    st.bar_chart(gw_breakdown, x="Groundwater component", y="Score", height=260)
 
 elif active_view == "Crop-Tech Comparison":
     st.subheader("Compare Crop and Greenhouse Technology Packages")
