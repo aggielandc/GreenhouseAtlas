@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import io
 import math
 import os
@@ -1230,6 +1231,91 @@ def add_groundwater_wells(map_object: folium.Map, wells: gpd.GeoDataFrame) -> No
     group.add_to(map_object)
 
 
+def popup_value(value: object, suffix: str = "", missing: str = "N/A", decimals: int = 1) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        text = str(value).strip() if value is not None else ""
+        return html.escape(text) if text else missing
+    if not np.isfinite(numeric):
+        return missing
+    if abs(numeric) >= 1000:
+        rendered = f"{numeric:,.0f}"
+    else:
+        rendered = f"{numeric:,.{decimals}f}"
+    return f"{rendered}{suffix}"
+
+
+def selected_marker_tooltip(suitability: Optional[dict], climate: Optional[dict]) -> str:
+    if not suitability:
+        return "Selected greenhouse site"
+    status = suitability.get("status", "Selected site")
+    score = suitability.get("score", 0)
+    landuse_value = suitability.get("landuse", "Unknown land use")
+    rh = climate.get("rh_pct") if climate else np.nan
+    temp = climate.get("temp_c") if climate else np.nan
+    groundwater = suitability.get("groundwater_score", 0)
+    return (
+        f"Selected site | Score {score}/100 | {landuse_value} | "
+        f"{popup_value(temp, ' °C')} / {popup_value(rh, '% RH')} | "
+        f"GW {groundwater}/100 | {status}"
+    )
+
+
+def selected_marker_popup_html(suitability: Optional[dict], climate: Optional[dict], report: Optional[dict]) -> str:
+    if not suitability:
+        return "<b>Selected greenhouse site</b>"
+    escaped_status = html.escape(str(suitability.get("status", "Selected site")))
+    status_color = "#166534" if not suitability.get("is_excluded") else "#991b1b"
+    landuse_value = html.escape(str(suitability.get("landuse", "Unknown")))
+    landuse_name = html.escape(str(suitability.get("landuse_name", "")))
+    aquifer = html.escape(str(suitability.get("groundwater_aquifer_zone", "Not available")))
+    tier = html.escape(str(suitability.get("groundwater_source_tier", "Not available")))
+    nearest_gw = html.escape(str(suitability.get("nearest_groundwater", "Not available")))
+
+    rows = [
+        ("Suitability", f"{popup_value(suitability.get('score'), '/100', decimals=0)}"),
+        ("Status", escaped_status),
+        ("Land use", landuse_value),
+        ("Climate", f"{popup_value(climate.get('temp_c') if climate else np.nan, ' °C')} / {popup_value(climate.get('rh_pct') if climate else np.nan, '% RH')}"),
+        ("Solar", popup_value(climate.get("ghi_w_m2") if climate else np.nan, " W/m²", decimals=0)),
+        ("Grid", format_distance(float(suitability.get("grid_distance_m", float("inf"))))),
+        ("Road", format_distance(float(suitability.get("road_distance_m", float("inf"))))),
+        ("Groundwater", f"{popup_value(suitability.get('groundwater_score'), '/100', decimals=0)} | {format_distance(float(suitability.get('groundwater_distance_m', float('inf'))))}"),
+        ("TDS / salinity", popup_value(suitability.get("groundwater_tds_mg_l"), " mg/L", decimals=0)),
+        ("Aquifer stress", popup_value(suitability.get("groundwater_aquifer_stress_ratio"), "x safe yield", decimals=1)),
+        ("Aquifer zone", aquifer),
+        ("Evidence tier", tier),
+    ]
+
+    if report:
+        rows.extend(
+            [
+                ("Tomato + fan-pad yield", popup_value(report.get("yield_tons"), " t/yr", decimals=1)),
+                ("Water", popup_value(report.get("total_water_m3"), " m³/yr", decimals=0)),
+                ("Energy", popup_value(report.get("total_energy_mwh"), " MWh/yr", decimals=0)),
+                ("Net profit", f"QAR {popup_value(report.get('net_profit_qar'), decimals=0)}"),
+            ]
+        )
+
+    row_html = "\n".join(
+        f"<tr><td style='color:#475569;padding:3px 8px 3px 0;'>{html.escape(label)}</td>"
+        f"<td style='font-weight:600;color:#0f172a;padding:3px 0;'>{value}</td></tr>"
+        for label, value in rows
+    )
+    note = "No-build location: analysis is diagnostic only." if suitability.get("is_excluded") else "Planning-grade screening result."
+    return f"""
+    <div style="font-family:Arial,sans-serif;width:330px;line-height:1.25;">
+      <div style="font-size:15px;font-weight:700;color:{status_color};margin-bottom:4px;">Selected Greenhouse Site</div>
+      <div style="font-size:12px;color:#475569;margin-bottom:7px;">{landuse_name}</div>
+      <table style="border-collapse:collapse;font-size:12px;width:100%;">{row_html}</table>
+      <div style="font-size:11px;color:#64748b;margin-top:8px;border-top:1px solid #e2e8f0;padding-top:6px;">
+        Nearest groundwater: {nearest_gw}. {html.escape(note)}
+      </div>
+    </div>
+    """
+
+
 def build_map(
     lat: float,
     lon: float,
@@ -1240,6 +1326,9 @@ def build_map(
     show_landuse: bool,
     show_groundwater: bool,
     heatmap_resolution: int,
+    suitability: Optional[dict] = None,
+    climate: Optional[dict] = None,
+    selected_report: Optional[dict] = None,
 ) -> folium.Map:
     map_object = folium.Map(location=[25.3548, 51.1839], zoom_start=9, tiles="CartoDB positron", control_scale=True)
     folium.Rectangle(
@@ -1283,8 +1372,14 @@ def build_map(
         add_groundwater_wells(map_object, layers["groundwater_wells"])
 
     marker_color = "red" if not QATAR_POLYGON.contains(Point(lon, lat)) else "green"
-    marker_text = "Selected point - water/offshore" if marker_color == "red" else "Selected greenhouse site"
-    folium.Marker([lat, lon], tooltip=marker_text, icon=folium.Icon(color=marker_color, icon="leaf")).add_to(map_object)
+    marker_text = "Selected point - water/offshore" if marker_color == "red" else selected_marker_tooltip(suitability, climate)
+    popup_html = selected_marker_popup_html(suitability, climate, selected_report)
+    folium.Marker(
+        [lat, lon],
+        tooltip=folium.Tooltip(marker_text, sticky=True),
+        popup=folium.Popup(folium.Html(popup_html, script=False), max_width=380),
+        icon=folium.Icon(color=marker_color, icon="leaf"),
+    ).add_to(map_object)
     folium.LayerControl(collapsed=True).add_to(map_object)
     map_object.fit_bounds([[24.55, 50.72], [26.18, 51.66]])
     return map_object
@@ -1441,10 +1536,34 @@ suitability = calculate_suitability(lat, lon, weights, layers)
 climate = interpolate_climate(lat, lon)
 
 if active_view == "Suitability Map":
+    default_report = analyze_location(
+        lat,
+        lon,
+        CROP_DATABASE["Tomato - truss/cherry"],
+        GREENHOUSE_TECHS["Fan-pad evaporative"],
+        int(area_m2),
+        transmissivity,
+        recycle,
+        landuse,
+        include_microclimate=not fast_mode,
+    )
     map_col, metric_col = st.columns([2.15, 0.85], gap="medium")
     with map_col:
         st.subheader("National Feasibility Map")
-        map_object = build_map(lat, lon, weights, layers, show_heatmap, show_infra, show_landuse, show_groundwater, heatmap_resolution)
+        map_object = build_map(
+            lat,
+            lon,
+            weights,
+            layers,
+            show_heatmap,
+            show_infra,
+            show_landuse,
+            show_groundwater,
+            heatmap_resolution,
+            suitability=suitability,
+            climate=climate,
+            selected_report=default_report,
+        )
         map_data = st_folium(map_object, height=760, use_container_width=True)
         if map_data and map_data.get("last_clicked"):
             st.session_state.selected_lat = map_data["last_clicked"]["lat"]
@@ -1490,17 +1609,6 @@ if active_view == "Suitability Map":
                 f"{suitability['groundwater_data_completeness']:.0%}. {GW_SOURCE_SUMMARY}"
             )
 
-        default_report = analyze_location(
-            lat,
-            lon,
-            CROP_DATABASE["Tomato - truss/cherry"],
-            GREENHOUSE_TECHS["Fan-pad evaporative"],
-            int(area_m2),
-            transmissivity,
-            recycle,
-            landuse,
-            include_microclimate=not fast_mode,
-        )
         with st.expander("Site report: tomato + fan-pad", expanded=not suitability["is_excluded"]):
             r1, r2 = st.columns(2)
             r1.metric("Annual yield", f"{default_report['yield_tons']:,.1f} t")
