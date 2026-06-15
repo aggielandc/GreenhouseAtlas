@@ -1255,11 +1255,27 @@ def selected_marker_tooltip(suitability: Optional[dict], climate: Optional[dict]
     rh = climate.get("rh_pct") if climate else np.nan
     temp = climate.get("temp_c") if climate else np.nan
     groundwater = suitability.get("groundwater_score", 0)
-    return (
-        f"Selected site | Score {score}/100 | {landuse_value} | "
-        f"{popup_value(temp, ' °C')} / {popup_value(rh, '% RH')} | "
-        f"GW {groundwater}/100 | {status}"
-    )
+    status_color = "#166534" if not suitability.get("is_excluded") else "#991b1b"
+    return f"""
+    <div style="font-family:Arial,sans-serif;width:220px;white-space:normal;line-height:1.22;">
+      <div style="font-size:12px;font-weight:700;color:{status_color};margin-bottom:3px;">Selected Site</div>
+      <div style="display:flex;justify-content:space-between;gap:8px;font-size:11px;">
+        <span style="color:#475569;">Suitability</span><b style="color:#0f172a;">{popup_value(score, '/100', decimals=0)}</b>
+      </div>
+      <div style="display:flex;justify-content:space-between;gap:8px;font-size:11px;">
+        <span style="color:#475569;">Land use</span><b style="color:#0f172a;text-align:right;">{html.escape(str(landuse_value))}</b>
+      </div>
+      <div style="display:flex;justify-content:space-between;gap:8px;font-size:11px;">
+        <span style="color:#475569;">Climate</span><b style="color:#0f172a;">{popup_value(temp, ' °C')} / {popup_value(rh, '% RH')}</b>
+      </div>
+      <div style="display:flex;justify-content:space-between;gap:8px;font-size:11px;">
+        <span style="color:#475569;">Groundwater</span><b style="color:#0f172a;">{popup_value(groundwater, '/100', decimals=0)}</b>
+      </div>
+      <div style="font-size:10px;color:#64748b;margin-top:4px;border-top:1px solid #e2e8f0;padding-top:3px;">
+        {html.escape(str(status))}
+      </div>
+    </div>
+    """
 
 
 def selected_marker_popup_html(suitability: Optional[dict], climate: Optional[dict], report: Optional[dict]) -> str:
@@ -1463,6 +1479,7 @@ st.markdown(
     div[data-testid="stMetric"] label {font-size: 0.78rem;}
     div[data-testid="stMetricValue"] {font-size: 1.05rem;}
     .small-note {font-size: 0.86rem; color: #4b5563;}
+    .leaflet-tooltip {white-space: normal !important; max-width: 240px !important;}
     </style>
     """,
     unsafe_allow_html=True,
